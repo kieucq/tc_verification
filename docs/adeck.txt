@@ -1,0 +1,61 @@
+**ATCF A-deck (`adeck`) tropical-cyclone forecast data**, it is a fixed-width/comma-delimited format used by the National Hurricane Center and other agencies to store **forecast track, intensity, and related information**.
+
+ A typical A-deck line looks roughly like:
+
+```
+AL, 09, 2026093018, 03, OFCL, 000, 251N, 0715W, 075, 0970,
+...
+```
+
+ The exact fields depend on the A-deck record type and version.
+
+ ### Basic structure
+
+ The beginning of a typical A-deck record contains:
+
+ | Field | Meaning | Example |
+| --- | --- | --- |
+| Basin | ATCF basin identifier | `AL` |
+| Storm number | Cyclone number for that basin/year | `09` |
+| Date/time | Forecast cycle | `2026093018` |
+| Technique number | ATCF technique/model identifier | `03` |
+| Technique | Forecast source | `OFCL` |
+| Forecast hour | Hours after initialization | `000` |
+| Latitude | Position | `251N` |
+| Longitude | Position | `0715W` |
+| Max wind | Maximum sustained wind, kt | `075` |
+| Min pressure | Central pressure, mb | `0970` |
+
+So, for example:
+
+```
+AL, 09, 2026093018, 03, OFCL, 000, 251N, 0715W, 075, 0970
+```
+
+ can be interpreted approximately as:
+
+ - **AL** → Atlantic
+- **09** → storm 09
+- **2026093018** → 2026 September 30, 18 UTC initialization
+- **OFCL** → official forecast
+- **000** → initial position
+- **251N** → 25.1°N
+- **0715W** → 71.5°W
+- **075** → 75 kt maximum wind
+- **0970** → 970 hPa minimum pressure
+
+ ### One important detail
+
+ The A-deck isn't simply "the forecast track." It can contain records from many forecast techniques:
+
+ - `OFCL` — official forecast
+- `GFS` — GFS-based forecast
+- `ECMWF` — ECMWF-based forecast
+- `HWRF`, `HMON`, etc.
+- consensus aids such as `TVCA`, `TVCN`
+- climatology/persistence aids
+- ensemble-related guidance
+
+ The **technique ID and technique name** are therefore particularly important when you're processing the data.
+
+ If you're working with an actual A-deck file, **paste 2–5 lines here** (or upload the file), and I can go through **every column/field in that exact format**, including the less obvious fields such as radii, wind radii, forecast type, technique numbers, and genesis records.

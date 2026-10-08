@@ -1,0 +1,82 @@
+The **ATCF B-deck (`bdeck`)** is the **best-track / observed-track counterpart to the A-deck**. While the A-deck contains forecasts from different techniques, the B-deck contains the storm's analyzed/observed position and intensity at each analysis time.
+
+ A typical B-deck line looks like:
+
+```
+AL, 09, 2026093018, 03, BEST, 000, 251N, 0715W, 075, 0970, ...
+```
+
+ The most important fields are:
+
+ | Field | Meaning | Example |
+| --- | --- | --- |
+| Basin | Basin identifier | `AL` |
+| CY | Cyclone number | `09` |
+| Date/time | Analysis time | `2026093018` |
+| Record type | Usually `BEST` | `BEST` |
+| Forecast hour | Usually `000` for best track | `000` |
+| Latitude | Storm center latitude | `251N` |
+| Longitude | Storm center longitude | `0715W` |
+| Maximum wind | kt | `075` |
+| Minimum pressure | hPa/mb | `0970` |
+
+So:
+
+```
+AL, 09, 2026093018, 03, BEST, 000, 251N, 0715W, 075, 0970
+```
+
+ means approximately:
+
+ > At 18 UTC on September 30, storm 09 in the Atlantic was analyzed at **25.1°N, 71.5°W**, with **75 kt** maximum sustained wind and **970 hPa** minimum central pressure.
+
+ ### A-deck vs B-deck
+
+ The distinction is important:
+
+ **A-deck**
+
+```
+forecast model → predicted future position/intensity
+```
+
+ For example:
+
+```
+OFCL → 24 h → 27.0N 70.0W
+```
+
+ **B-deck**
+
+```
+best-track analysis → what actually happened / was analyzed
+```
+
+ For example:
+
+```
+BEST → 00 h → 25.1N 71.5W
+```
+
+ You can therefore use the B-deck as the **verification/reference track** for an A-deck forecast.
+
+ ### But there is an important complication
+
+ The B-deck contains considerably more information than the first 10 fields. Depending on the ATCF version/data source, you can encounter fields for:
+
+ - wind radii
+- wind radii quadrants
+- radius of maximum wind
+- pressure/wind measurements
+- tropical cyclone status
+- subtropical vs tropical classification
+- depth
+- eye diameter
+- source/agency
+- forecast/analysis flags
+- storm motion
+- radii of different wind thresholds
+
+ Also, **the exact B-deck format has evolved**, so I wouldn't recommend writing a parser based only on a generic example.
+
+ If you're processing **real ATCF B-deck files**, send me one actual line (or the file). I can give you a **field-by-field decoding of that exact B-deck format**, including the meaning and units of _every comma-separated column_.
