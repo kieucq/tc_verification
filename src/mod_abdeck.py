@@ -12,7 +12,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ADECK_DIR = PROJECT_ROOT / "data" / "adeck"
 BDECK_DIR = PROJECT_ROOT / "data" / "bdeck"
-BASIN_FILE_CODES = {"L": "al", "W": "wp", "E": "ep"}
+BASIN_FILE_CODES = {"L": "al", "W": "wp", "E": "ep", "C": "cp"}
 SUPPORTED_METRICS = {"VMAX", "PMIN", "RMW", "R34", "R50", "R64"}
 
 
@@ -148,7 +148,8 @@ def find_bdeck_threshold_period(
     Parameters
     ----------
     storm_id : str
-        Two-digit storm number followed by L, W, or E, for example ``"17E"``.
+        Two-digit storm number followed by L, W, E, or C, for example
+        ``"17E"``.
     year : str
         Four-digit storm year.
     metric : str
@@ -169,8 +170,8 @@ def find_bdeck_threshold_period(
     year = str(year).strip()
     metric = str(metric).strip().upper()
 
-    if not re.fullmatch(r"\d{2}[LWE]", storm_id):
-        raise ValueError("storm_id must be two digits followed by L, W, or E.")
+    if not re.fullmatch(r"\d{2}[LWEC]", storm_id):
+        raise ValueError("storm_id must be two digits followed by L, W, E, or C.")
     if not re.fullmatch(r"\d{4}", year):
         raise ValueError("year must be a four-digit string.")
     if metric not in SUPPORTED_METRICS:
