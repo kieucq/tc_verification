@@ -234,3 +234,210 @@ def verify_single_storm(
         corr.append(abdeck._pearson_correlation(forecast_values, observed))
 
     return errs, errs_abs, errs_bias, corr, n_cases
+
+
+def verify_multiple_storm(
+    storms: List[str],
+    threshold: float,
+    metric: str,
+    models: List[str],
+    hh: int,
+    lead_time: int,
+    sample_mode: str = "strict",
+) -> Tuple[
+    List[List[float]],
+    List[List[float]],
+    List[float],
+    List[int],
+]:
+    """Verify and aggregate one threshold period from multiple storms.
+
+    Each entry in ``storms`` must be an A-deck filename such as
+    ``"aep172026.dat"``. The basin/file prefixes currently supported by
+    :func:`verify_single_storm` are ``aal``, ``awp``, and ``aep``.
+
+    For every storm, :func:`mod_abdeck.find_bdeck_threshold_period` selects
+    the first contiguous B-deck interval in which ``metric`` is strictly
+    greater than ``threshold`` (strictly less for PMIN). Its exclusive end
+    is converted to the last qualifying B-deck cycle before calling
+    :func:`verify_single_storm`, whose end-cycle argument is inclusive.
+    Storms that never meet the threshold are skipped.
+
+    The mean absolute and signed errors pool all finite cases from all
+    selected storms at each model and lead time. Thus storms contribute in
+    proportion to their number of verified cycles. Correlation is first
+    calculated by :func:`verify_single_storm` for each storm/model and then
+    averaged with equal weight over storms having a finite correlation.
+
+    Parameters
+    ----------
+    storms : list[str]
+        A-deck filenames of the form ``a{basin}{storm_number}{yyyy}.dat``,
+        for example ``["aep172026.dat", "aal052026.dat"]``.
+    threshold : float
+        B-deck threshold used to select each storm's verification period.
+    metric : str
+        One of VMAX, PMIN, RMW, R34, R50, or R64.
+    models : list[str]
+        Four-character ATCF technique identifiers.
+    hh : int
+        Verification interval in hours.
+    lead_time : int
+        Verification-window length. Leads are ``0`` through
+        ``(int(lead_time / hh) - 1) * hh``.
+    sample_mode : {"strict", "relaxed"}, default="strict"
+        Sampling rule passed unchanged to :func:`verify_single_storm`.
+
+    Returns
+    -------
+    errs_abs : list[list[float]]
+        Pooled mean absolute error at each lead for each model.
+    errs_bias : list[list[float]]
+        Pooled mean signed error at each lead for each model.
+    corr : list[float]
+        Mean of the finite per-storm correlations for each model.
+    n_cases : list[int]
+        Total verified cases across storms at each lead time.
+    """
+    if not isinstance(storms, list) or not storms:
+        raise ValueError("storms must be a non-empty list of A-deck filenames.")
+
+    normalized_storms = [str(storm).strip().lower() for storm in storms]
+    if len(set(normalized_storms)) != len(normalized_storms):
+        raise ValueError("storms must not contain duplicates.")
+
+    parsed_storms = []
+    basin_ids = {"al": "L", "wp": "W", "ep": "E"}
+    for storm in normalized_storms:
+        match = re.fullmatch(r"a(al|wp|ep)(\d{2})(\d{4})\.dat", storm)
+        if match is None:
+            raise ValueError(
+                "Every storm must be an A-deck filename such as "
+                "'aal052026.dat', 'awp012026.dat', or 'aep172026.dat'."
+            )
+        adeck_path = ADECK_DIR / storm
+        if not adeck_path.is_file():
+            raise FileNotFoundError(f"A-deck file not found: {adeck_path}")
+        basin_code, storm_number, year = match.groups()
+        parsed_storms.append((storm_number + basin_ids[basin_code], year))
+
+    metric = str(metric).strip().upper()
+    sample_mode = str(sample_mode).strip().lower()
+    if metric not in SUPPORTED_METRICS:
+        raise ValueError(f"metric must be one of {sorted(SUPPORTED_METRICS)}.")
+    if isinstance(threshold, bool):
+        raise ValueError("threshold must be a finite number.")
+    try:
+        threshold_value = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("threshold must be a finite number.") from exc
+    if not np.isfinite(threshold_value):
+        raise ValueError("threshold must be a finite number.")
+    if not isinstance(models, list) or not models:
+        raise ValueError("models must be a non-empty list.")
+    normalized_models = [str(model).strip().upper() for model in models]
+    if any(
+        not re.fullmatch(r"[A-Z0-9]{4}", model)
+        for model in normalized_models
+    ):
+        raise ValueError("Every model must be a four-character ATCF identifier.")
+    if len(set(normalized_models)) != len(normalized_models):
+        raise ValueError("models must not contain duplicates.")
+    if isinstance(hh, bool) or not isinstance(hh, int) or hh <= 0:
+        raise ValueError("hh must be a positive integer.")
+    if (
+        isinstance(lead_time, bool)
+        or not isinstance(lead_time, int)
+        or lead_time < hh
+    ):
+        raise ValueError("lead_time must be an integer greater than or equal to hh.")
+    if sample_mode not in {"strict", "relaxed"}:
+        raise ValueError("sample_mode must be either 'strict' or 'relaxed'.")
+
+    n_models = len(normalized_models)
+    n_leads = int(lead_time / hh)
+    absolute_error_sums = np.zeros((n_models, n_leads), dtype=float)
+    signed_error_sums = np.zeros((n_models, n_leads), dtype=float)
+    correlation_sums = np.zeros(n_models, dtype=float)
+    correlation_counts = np.zeros(n_models, dtype=int)
+    n_cases = np.zeros(n_leads, dtype=int)
+
+    for storm_id, year in parsed_storms:
+        start_cycle, exclusive_end_cycle = abdeck.find_bdeck_threshold_period(
+            storm_id=storm_id,
+            year=year,
+            metric=metric,
+            threshold=threshold_value,
+            bdeck_dir=BDECK_DIR,
+        )
+        if start_cycle is None:
+            continue
+
+        end_cycle = None
+        if exclusive_end_cycle is not None:
+            storm_number, basin_id = storm_id[:2], storm_id[2]
+            bdeck_path = (
+                BDECK_DIR
+                / f"b{BASIN_FILE_CODES[basin_id]}{storm_number}{year}.dat"
+            )
+            start_dt = abdeck._parse_cycle(start_cycle, "start_cycle")
+            exclusive_end_dt = abdeck._parse_cycle(
+                exclusive_end_cycle, "end_cycle"
+            )
+            qualifying_times = [
+                cycle
+                for cycle in abdeck._read_bdeck_times(bdeck_path)
+                if start_dt <= cycle < exclusive_end_dt
+            ]
+            if not qualifying_times:
+                continue
+            end_cycle = max(qualifying_times).strftime("%Y%m%d%H")
+
+        storm_errs, _, _, storm_corr, storm_n_cases = verify_single_storm(
+            storm_id=storm_id,
+            year=year,
+            start_cycle=start_cycle,
+            end_cycle=end_cycle,
+            models=normalized_models,
+            hh=hh,
+            lead_time=lead_time,
+            metric=metric,
+            sample_mode=sample_mode,
+        )
+
+        n_cases += np.asarray(storm_n_cases, dtype=int)
+        for model_index, model_errors in enumerate(storm_errs):
+            for lead_index in range(n_leads):
+                valid_errors = model_errors[:, lead_index]
+                valid_errors = valid_errors[np.isfinite(valid_errors)]
+                if valid_errors.size != storm_n_cases[lead_index]:
+                    raise RuntimeError(
+                        "Internal sample-count mismatch while aggregating storms."
+                    )
+                absolute_error_sums[model_index, lead_index] += np.sum(
+                    np.abs(valid_errors)
+                )
+                signed_error_sums[model_index, lead_index] += np.sum(valid_errors)
+
+            if np.isfinite(storm_corr[model_index]):
+                correlation_sums[model_index] += storm_corr[model_index]
+                correlation_counts[model_index] += 1
+
+    errs_abs = np.full((n_models, n_leads), np.nan, dtype=float)
+    errs_bias = np.full((n_models, n_leads), np.nan, dtype=float)
+    nonzero_leads = n_cases > 0
+    errs_abs[:, nonzero_leads] = (
+        absolute_error_sums[:, nonzero_leads] / n_cases[nonzero_leads]
+    )
+    errs_bias[:, nonzero_leads] = (
+        signed_error_sums[:, nonzero_leads] / n_cases[nonzero_leads]
+    )
+
+    corr = np.full(n_models, np.nan, dtype=float)
+    valid_correlations = correlation_counts > 0
+    corr[valid_correlations] = (
+        correlation_sums[valid_correlations]
+        / correlation_counts[valid_correlations]
+    )
+
+    return errs_abs.tolist(), errs_bias.tolist(), corr.tolist(), n_cases.tolist()
