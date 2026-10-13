@@ -441,3 +441,188 @@ def verify_multiple_storm(
     )
 
     return errs_abs.tolist(), errs_bias.tolist(), corr.tolist(), n_cases.tolist()
+
+
+def compute_ensemble_spread(
+    models: List[str],
+    metric: str,
+    storms: List[str],
+    lead_time: int,
+    initial_intensity_values: List[float],
+) -> Tuple[List[float], List[int]]:
+    """Compute ensemble spread by initial-intensity range.
+
+    Every explicit storm must be an A-deck filename such as
+    ``"aep172026.dat"``. A storm number of ``ALL``, for example
+    ``"aepALL2026.dat"``, expands to every numbered A-deck in that basin
+    and year. Basin filename codes ``al``, ``wp``, ``ep``, and ``cp`` are
+    supported.
+
+    A forecast cycle is included only when every requested model has the
+    selected metric at both lead 0 and ``lead_time``. Its initial intensity
+    is the arithmetic mean of the models' lead-0 values. For each requested
+    value ``V_i``, cycles with initial ensemble-mean intensity in the closed
+    interval ``[V_i - 5, V_i + 5]`` are selected. Ranges are evaluated
+    independently, so a cycle can contribute to overlapping ranges.
+
+    Ensemble variance is calculated across models at ``lead_time`` for each
+    qualifying cycle using the population definition (``ddof=0``). The
+    reported spread is the square root of the mean of those cycle variances
+    across all selected storms. This weights every forecast cycle equally.
+
+    Parameters
+    ----------
+    models : list[str]
+        At least two four-character ATCF model identifiers.
+    metric : str
+        One of VMAX, PMIN, RMW, R34, R50, or R64.
+    storms : list[str]
+        Explicit A-deck filenames and/or ``ALL`` patterns such as
+        ``["aep172026.dat", "aalALL2025.dat"]``.
+    lead_time : int
+        Non-negative forecast lead time in hours at which spread is
+        calculated.
+    initial_intensity_values : list[float]
+        Centers of the initial-intensity ranges. Each range is ``V_i +/- 5``
+        in the selected metric's native units.
+
+    Returns
+    -------
+    spread : list[float]
+        Ensemble spread for each input intensity-range center, in the same
+        order as ``initial_intensity_values``. A range with no qualifying
+        cycles is NaN.
+    n_cases : list[int]
+        Number of common forecast cycles in each intensity range.
+    """
+    if not isinstance(models, list) or len(models) < 2:
+        raise ValueError("models must be a list containing at least two models.")
+    normalized_models = [str(model).strip().upper() for model in models]
+    if any(
+        not re.fullmatch(r"[A-Z0-9]{4}", model)
+        for model in normalized_models
+    ):
+        raise ValueError("Every model must be a four-character ATCF identifier.")
+    if len(set(normalized_models)) != len(normalized_models):
+        raise ValueError("models must not contain duplicates.")
+
+    metric = str(metric).strip().upper()
+    if metric not in SUPPORTED_METRICS:
+        raise ValueError(f"metric must be one of {sorted(SUPPORTED_METRICS)}.")
+    if not isinstance(storms, list) or not storms:
+        raise ValueError("storms must be a non-empty list of A-deck filenames.")
+    normalized_storms = [str(storm).strip().lower() for storm in storms]
+    if len(set(normalized_storms)) != len(normalized_storms):
+        raise ValueError("storms must not contain duplicates.")
+    if (
+        isinstance(lead_time, bool)
+        or not isinstance(lead_time, int)
+        or lead_time < 0
+    ):
+        raise ValueError("lead_time must be a non-negative integer.")
+    if not isinstance(initial_intensity_values, list) or not initial_intensity_values:
+        raise ValueError("initial_intensity_values must be a non-empty list.")
+
+    intensity_centers = []
+    for value in initial_intensity_values:
+        if isinstance(value, bool):
+            raise ValueError("Every initial intensity value must be finite.")
+        try:
+            center = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Every initial intensity value must be finite."
+            ) from exc
+        if not np.isfinite(center):
+            raise ValueError("Every initial intensity value must be finite.")
+        intensity_centers.append(center)
+    if len(set(intensity_centers)) != len(intensity_centers):
+        raise ValueError("initial_intensity_values must not contain duplicates.")
+
+    adeck_paths = []
+    seen_paths = set()
+    storm_pattern = re.compile(r"a(al|wp|ep|cp)(\d{2}|all)(\d{4})\.dat")
+    explicit_pattern = re.compile(r"a(al|wp|ep|cp)\d{2}\d{4}\.dat")
+    for storm in normalized_storms:
+        match = storm_pattern.fullmatch(storm)
+        if match is None:
+            raise ValueError(
+                "Every storm must look like 'aep172026.dat' or "
+                "'aepALL2026.dat'."
+            )
+        basin_code, storm_number, year = match.groups()
+        if storm_number == "all":
+            matching_paths = sorted(
+                path
+                for path in ADECK_DIR.glob(f"a{basin_code}??{year}.dat")
+                if path.is_file() and explicit_pattern.fullmatch(path.name)
+            )
+            if not matching_paths:
+                raise FileNotFoundError(
+                    "No A-deck files found for "
+                    f"basin={basin_code!r}, year={year!r}."
+                )
+        else:
+            path = ADECK_DIR / storm
+            if not path.is_file():
+                raise FileNotFoundError(f"A-deck file not found: {path}")
+            matching_paths = [path]
+
+        for path in matching_paths:
+            if path not in seen_paths:
+                adeck_paths.append(path)
+                seen_paths.add(path)
+
+    variance_sums = np.zeros(len(intensity_centers), dtype=float)
+    n_cases = np.zeros(len(intensity_centers), dtype=int)
+    requested_models = set(normalized_models)
+
+    for adeck_path in adeck_paths:
+        forecast = abdeck._read_adeck_metric(
+            adeck_path, metric, requested_models
+        )
+        cycles_by_model = []
+        for model in normalized_models:
+            cycles_by_model.append(
+                {
+                    cycle
+                    for cycle, record_model, tau in forecast
+                    if record_model == model and tau == lead_time
+                }
+            )
+        common_cycles = set.intersection(*cycles_by_model)
+        common_cycles = {
+            cycle
+            for cycle in common_cycles
+            if all(
+                (cycle, model, 0) in forecast
+                for model in normalized_models
+            )
+        }
+
+        for cycle in common_cycles:
+            initial_values = np.asarray(
+                [forecast[(cycle, model, 0)] for model in normalized_models],
+                dtype=float,
+            )
+            forecast_values = np.asarray(
+                [
+                    forecast[(cycle, model, lead_time)]
+                    for model in normalized_models
+                ],
+                dtype=float,
+            )
+            initial_intensity = float(np.mean(initial_values))
+            ensemble_variance = float(np.var(forecast_values, ddof=0))
+
+            for index, center in enumerate(intensity_centers):
+                if center - 5.0 <= initial_intensity <= center + 5.0:
+                    variance_sums[index] += ensemble_variance
+                    n_cases[index] += 1
+
+    spread = np.full(len(intensity_centers), np.nan, dtype=float)
+    has_cases = n_cases > 0
+    spread[has_cases] = np.sqrt(
+        variance_sums[has_cases] / n_cases[has_cases]
+    )
+    return spread.tolist(), n_cases.tolist()
