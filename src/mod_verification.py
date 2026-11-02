@@ -626,3 +626,304 @@ def compute_ensemble_spread(
         variance_sums[has_cases] / n_cases[has_cases]
     )
     return spread.tolist(), n_cases.tolist()
+
+
+def compute_threshold_correlation_statistics(
+    storms: List[str],
+    models: List[str],
+    metric: str,
+    threshold_value_1: float,
+    threshold_value_2: float,
+    threshold_value_3: float,
+    threshold_value_4: float,
+    hh: int,
+    lead_time: int,
+    sample_mode: str = "strict",
+) -> Tuple[
+    List[List[float]],
+    List[List[float]],
+    List[List[int]],
+]:
+    """Summarize cycle-level intensity-change correlations in two ranges.
+
+    Initialization cycles are assigned using the B-deck VMAX at the cycle:
+    the first group contains cycles with
+    ``threshold_value_1 < VMAX < threshold_value_2`` and the second contains
+    cycles with ``threshold_value_3 < VMAX < threshold_value_4``. All bounds
+    are exclusive, and cycles outside both ranges are excluded.
+
+    For every qualifying initialization cycle, consecutive changes are
+    calculated at ``hh``-hour intervals from lead 0 through ``lead_time``
+    inclusive. For example, ``hh=6`` and ``lead_time=18`` produce changes
+    over 0--6, 6--12, and 12--18 hours. The Pearson correlation between the
+    model changes and the corresponding best-track changes is calculated
+    separately for each model and cycle.
+
+    The returned mean and population standard deviation are calculated
+    across all finite cycle correlations from all selected storms. Thus,
+    each initialization cycle is one statistical case. Correlation is
+    undefined for a cycle when fewer than two valid change pairs are
+    available or either change vector is constant; such a cycle is not
+    counted for that model.
+
+    In strict mode, a cycle must have the requested metric at every lead
+    from 0 through ``lead_time`` in the B-deck and for every requested model.
+    In relaxed mode, all models still use the same available change
+    intervals, but incomplete intervals are omitted independently for each
+    cycle.
+
+    Entries in ``storms`` may be explicit A-deck filenames such as
+    ``"aep172026.dat"`` or basin/year patterns such as ``"aepALL2026.dat"``.
+
+    Parameters
+    ----------
+    storms : list[str]
+        A-deck filenames and/or ``ALL`` basin/year patterns.
+    models : list[str]
+        Non-empty list of four-character ATCF model identifiers.
+    metric : str
+        Forecast/best-track metric whose correlation is calculated.
+    threshold_value_1 : float
+        Exclusive lower VMAX threshold for the left group.
+    threshold_value_2 : float
+        Exclusive upper VMAX threshold for the left group.
+    threshold_value_3 : float
+        Exclusive lower VMAX threshold for the right group.
+    threshold_value_4 : float
+        Exclusive upper VMAX threshold for the right group. Each lower bound
+        must be less than its corresponding upper bound. If the two ranges
+        overlap, qualifying cycles contribute to both groups.
+    hh : int
+        Interval in hours over which consecutive changes are calculated.
+    lead_time : int
+        Inclusive endpoint of the correlation window. It must be an exact
+        multiple of ``hh`` and at least ``2 * hh``. Leads are 0, ``hh``,
+        ..., ``lead_time``.
+    sample_mode : {"strict", "relaxed"}, default="strict"
+        Homogeneous sampling rule.
+
+    Returns
+    -------
+    mean_corr : list[list[float]]
+        Two-by-M array-like list. Row 0 is the first VMAX range and row 1 is
+        the second VMAX range; columns follow ``models``.
+    corr_std : list[list[float]]
+        Population standard deviation of the per-cycle correlations, with
+        the same two-by-M layout.
+    n_cycles : list[list[int]]
+        Number of finite per-cycle correlations contributing to each value.
+    """
+    if not isinstance(storms, list) or not storms:
+        raise ValueError("storms must be a non-empty list of A-deck filenames.")
+    normalized_storms = [str(storm).strip().lower() for storm in storms]
+    if len(set(normalized_storms)) != len(normalized_storms):
+        raise ValueError("storms must not contain duplicates.")
+
+    if not isinstance(models, list) or not models:
+        raise ValueError("models must be a non-empty list.")
+    normalized_models = [str(model).strip().upper() for model in models]
+    if any(
+        not re.fullmatch(r"[A-Z0-9]{4}", model)
+        for model in normalized_models
+    ):
+        raise ValueError("Every model must be a four-character ATCF identifier.")
+    if len(set(normalized_models)) != len(normalized_models):
+        raise ValueError("models must not contain duplicates.")
+
+    metric = str(metric).strip().upper()
+    sample_mode = str(sample_mode).strip().lower()
+    if metric not in SUPPORTED_METRICS:
+        raise ValueError(f"metric must be one of {sorted(SUPPORTED_METRICS)}.")
+    threshold_values = []
+    for name, value in (
+        ("threshold_value_1", threshold_value_1),
+        ("threshold_value_2", threshold_value_2),
+        ("threshold_value_3", threshold_value_3),
+        ("threshold_value_4", threshold_value_4),
+    ):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite number.") from exc
+        if not np.isfinite(number):
+            raise ValueError(f"{name} must be a finite number.")
+        threshold_values.append(number)
+    (
+        range_1_lower,
+        range_1_upper,
+        range_2_lower,
+        range_2_upper,
+    ) = threshold_values
+    if range_1_lower >= range_1_upper or range_2_lower >= range_2_upper:
+        raise ValueError(
+            "thresholds must satisfy threshold_value_1 < threshold_value_2 "
+            "and threshold_value_3 < threshold_value_4."
+        )
+    if isinstance(hh, bool) or not isinstance(hh, int) or hh <= 0:
+        raise ValueError("hh must be a positive integer.")
+    if (
+        isinstance(lead_time, bool)
+        or not isinstance(lead_time, int)
+        or lead_time < 2 * hh
+    ):
+        raise ValueError(
+            "lead_time must be an integer greater than or equal to 2 * hh "
+            "so that each complete cycle has at least two change pairs."
+        )
+    if lead_time % hh:
+        raise ValueError("lead_time must be an exact multiple of hh.")
+    if sample_mode not in {"strict", "relaxed"}:
+        raise ValueError("sample_mode must be either 'strict' or 'relaxed'.")
+
+    adeck_paths = []
+    seen_paths = set()
+    storm_pattern = re.compile(r"a(al|wp|ep|cp)(\d{2}|all)(\d{4})\.dat")
+    explicit_pattern = re.compile(r"a(al|wp|ep|cp)\d{2}\d{4}\.dat")
+    for storm in normalized_storms:
+        match = storm_pattern.fullmatch(storm)
+        if match is None:
+            raise ValueError(
+                "Every storm must look like 'aep172026.dat' or "
+                "'aepALL2026.dat'."
+            )
+        basin_code, storm_number, year = match.groups()
+        if storm_number == "all":
+            matching_paths = sorted(
+                path
+                for path in ADECK_DIR.glob(f"a{basin_code}??{year}.dat")
+                if path.is_file() and explicit_pattern.fullmatch(path.name)
+            )
+            if not matching_paths:
+                raise FileNotFoundError(
+                    "No A-deck files found for "
+                    f"basin={basin_code!r}, year={year!r}."
+                )
+        else:
+            path = ADECK_DIR / storm
+            if not path.is_file():
+                raise FileNotFoundError(f"A-deck file not found: {path}")
+            matching_paths = [path]
+
+        for path in matching_paths:
+            if path not in seen_paths:
+                adeck_paths.append(path)
+                seen_paths.add(path)
+
+    n_models = len(normalized_models)
+    lead_hours = np.arange(0, lead_time + hh, hh, dtype=int)
+    lead_intervals = list(zip(lead_hours[:-1], lead_hours[1:]))
+    correlations = [[[] for _ in range(n_models)] for _ in range(2)]
+
+    for adeck_path in adeck_paths:
+        bdeck_path = BDECK_DIR / f"b{adeck_path.name[1:]}"
+        if not bdeck_path.is_file():
+            raise FileNotFoundError(f"B-deck file not found: {bdeck_path}")
+
+        forecast = abdeck._read_adeck_metric(
+            adeck_path, metric, set(normalized_models)
+        )
+        best_track = abdeck._read_bdeck_metric(bdeck_path, metric)
+        initial_vmax = abdeck._read_bdeck_metric(bdeck_path, "VMAX")
+        bdeck_times = abdeck._read_bdeck_times(bdeck_path)
+
+        cycles_by_model = [
+            {
+                cycle
+                for cycle, record_model, _ in forecast
+                if record_model == model
+            }
+            for model in normalized_models
+        ]
+        candidate_cycles = set.intersection(*cycles_by_model)
+
+        def has_complete_point(cycle, tau: int) -> bool:
+            return (
+                cycle + timedelta(hours=tau) in best_track
+                and all(
+                    (cycle, model, tau) in forecast
+                    for model in normalized_models
+                )
+            )
+
+        cycle_groups = [
+            sorted(
+                cycle
+                for cycle in candidate_cycles
+                if cycle in initial_vmax
+                and range_1_lower < initial_vmax[cycle] < range_1_upper
+            ),
+            sorted(
+                cycle
+                for cycle in candidate_cycles
+                if cycle in initial_vmax
+                and range_2_lower < initial_vmax[cycle] < range_2_upper
+            ),
+        ]
+
+        for group_index, group_cycles in enumerate(cycle_groups):
+            if sample_mode == "strict":
+                cycles_and_intervals = [
+                    (cycle, lead_intervals)
+                    for cycle in group_cycles
+                    if cycle + timedelta(hours=lead_time) in bdeck_times
+                    and all(
+                        has_complete_point(cycle, int(tau))
+                        for tau in lead_hours
+                    )
+                ]
+            else:
+                cycles_and_intervals = []
+                for cycle in group_cycles:
+                    valid_intervals = [
+                        (start_tau, end_tau)
+                        for start_tau, end_tau in lead_intervals
+                        if has_complete_point(cycle, int(start_tau))
+                        and has_complete_point(cycle, int(end_tau))
+                    ]
+                    if valid_intervals:
+                        cycles_and_intervals.append((cycle, valid_intervals))
+
+            for model_index, model in enumerate(normalized_models):
+                for cycle, valid_intervals in cycles_and_intervals:
+                    forecast_changes = []
+                    observed_changes = []
+                    for start_tau, end_tau in valid_intervals:
+                        start_tau = int(start_tau)
+                        end_tau = int(end_tau)
+                        forecast_changes.append(
+                            forecast[(cycle, model, end_tau)]
+                            - forecast[(cycle, model, start_tau)]
+                        )
+                        observed_changes.append(
+                            best_track[
+                                cycle + timedelta(hours=end_tau)
+                            ]
+                            - best_track[
+                                cycle + timedelta(hours=start_tau)
+                            ]
+                        )
+                    cycle_corr = abdeck._pearson_correlation(
+                        np.asarray(forecast_changes, dtype=float),
+                        np.asarray(observed_changes, dtype=float),
+                    )
+                    if np.isfinite(cycle_corr):
+                        correlations[group_index][model_index].append(
+                            cycle_corr
+                        )
+
+    mean_corr = np.full((2, n_models), np.nan, dtype=float)
+    corr_std = np.full((2, n_models), np.nan, dtype=float)
+    n_cycles = np.zeros((2, n_models), dtype=int)
+    for group_index in range(2):
+        for model_index in range(n_models):
+            values = np.asarray(
+                correlations[group_index][model_index], dtype=float
+            )
+            n_cycles[group_index, model_index] = values.size
+            if values.size:
+                mean_corr[group_index, model_index] = np.mean(values)
+                corr_std[group_index, model_index] = np.std(values, ddof=0)
+
+    return mean_corr.tolist(), corr_std.tolist(), n_cycles.tolist()
